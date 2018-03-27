@@ -1,0 +1,172 @@
+#include "persistent_objects.h"
+
+#include <assert.h>
+#include <iostream>
+
+using namespace PersistentObjects;
+
+std::atomic<int> TransactionalAllocator::alloc_cnt;
+
+thread_local
+TransactionalRoot* PersistentObjects::working_transactional_root = nullptr;
+
+void PersistentObjects::set_transactional_root(TransactionalRoot* tr)
+{
+  working_transactional_root = tr;
+}
+
+  
+PersistencyRoot rootInstance;
+// FIXME: in fact we need to obtain that root from persistent store(pool)
+PersistencyRoot* PersistentObjects::root = &rootInstance;
+
+
+AllocEntry TransactionalAllocator::alloc(size_t uint8_ts)
+{
+  void* ptr = malloc(uint8_ts); // FIXME
+  AllocEntry e;
+  e.offset = (uint64_t)ptr;
+  e.length = (uint32_t)uint8_ts; // FIXME: adjust length to take service and alignment uint8_ts into account?
+
+  alloc_cnt++;
+  std::cout << "new(" << alloc_cnt << ") " << e.offset << "~" << e.length << std::endl;
+
+  return e;
+}
+
+void TransactionalAllocator::free(const AllocEntry& e)
+{
+  alloc_cnt--;
+  std::cout << "del(" << alloc_cnt << ") " << e.offset << std::endl;
+  return ::free((void*)e.offset); // FIXME
+}
+
+void TransactionalRoot::replay()
+{
+  set_transactional_root(this);
+  if (idPrev < idNext) {
+
+    // throw away uncommitted part
+    alloc_log_next = alloc_log_cur;
+
+    while (obj_log_start < obj_log_end) {
+      ObjLogEntry& o = obj_log[obj_log_start];
+      o.obj->recover(o.tid, o.ptr);
+      ++obj_log_start;
+    }
+    obj_log_end = obj_log_start = 0;
+    idPrev.store(idPrev);
+  }
+  else {
+    assert(idPrev == idNext);
+
+    // for sure - they can mismatch but that's safe
+    // (see comments in commit_transaction)
+    //
+    alloc_log_cur = alloc_log_next;
+    obj_log_start = obj_log_end;
+  }
+  auto i = alloc_log_start;
+  while (i < alloc_log_next) {
+    if (alloc_log[i].is_release()) {
+      allocator.apply_release(alloc_log[i]);
+    }
+    else {
+      allocator.note_alloc(alloc_log[i]);
+    }
+
+    ++i;
+  }
+  set_transactional_root(nullptr);
+}
+
+int TransactionalRoot::start_transaction()
+{
+  LOCK;
+  assert(idPrev <= idNext);
+  assert(alloc_log_cur == alloc_log_next);
+  assert(obj_log_start == obj_log_end);
+  set_transactional_root(this);
+  ++idNext;
+
+  return 0;
+}
+
+int TransactionalRoot::commit_transaction()
+{
+  assert(idPrev < idNext);
+  for (auto& d : *objects2release)
+  {
+    d.p->destroy(*this, d.destroy_fn);
+  }
+  objects2release->clear();
+  set_transactional_root(nullptr);
+
+  idPrev.store(idNext);
+
+  // Need to handle in alloc_log reply code the case when we fail exatly at
+  // this point. In fact we can just ignore the difference if transaction
+  // is not in progress (idPrev == idNext)
+  alloc_log_cur = alloc_log_next;
+
+  // the same handling as above here - ignore the diff if no transaction
+  // is in progress
+  obj_log_start = obj_log_end;
+
+  UNLOCK;
+  return 0;
+}
+
+int TransactionalRoot::rollback_transaction()
+{
+  assert(idPrev < idNext);
+
+  objects2release->clear();
+
+  // revert allocations
+  auto i = alloc_log_cur;
+  while (i < alloc_log_next) {
+    if (!alloc_log[i].is_release()) {
+      allocator.free(alloc_log[i]);
+    }
+    ++i;
+  }
+  alloc_log_next = alloc_log_cur;
+
+  while (obj_log_start < obj_log_end) {
+    ObjLogEntry& o = obj_log[obj_log_start];
+    o.obj->recover(o.tid, o.ptr);
+    ++obj_log_start;
+  }
+  obj_log_end = obj_log_start = 0;
+  set_transactional_root(nullptr);
+
+  idNext.store(idPrev);
+
+  UNLOCK;
+  return 0;
+}
+
+void TransactionalRoot::queue_in_progress(PObjRecoverable* obj, TransactionId tid, void* ptr)
+{
+  assert(obj_log_end < obj_log_size);
+  ObjLogEntry& e = obj_log[obj_log_end];
+  e = ObjLogEntry(obj, tid, ptr);
+  obj_log_end++;
+}
+
+void* PObjBase::operator new(size_t sz, TransactionalRoot& tr)
+{
+  return tr.alloc_persistent_raw(sz);
+}
+
+void PObjBase::operator delete(void* ptr, TransactionalRoot& tr)
+{
+  tr.free_persistent_raw(ptr);
+}
+void PObjBase::destroy(TransactionalRoot& tr, dtor destroy_fn)
+{
+  destroy_fn(this); // virtual dtor replacement as we can't use virtuals
+                    // operator delete(this, tr);
+  operator delete(this, tr);
+}
