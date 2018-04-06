@@ -5,8 +5,6 @@
 
 using namespace PersistentObjects;
 
-std::atomic<int> TransactionalAllocator::alloc_cnt;
-
 thread_local
 TransactionalRoot* PersistentObjects::working_transactional_root = nullptr;
 
@@ -29,7 +27,7 @@ AllocEntry TransactionalAllocator::alloc(size_t uint8_ts)
   e.length = (uint32_t)uint8_ts; // FIXME: adjust length to take service and alignment uint8_ts into account?
 
   alloc_cnt++;
-  std::cout << "new(" << alloc_cnt << ") " << e.offset << "~" << e.length << std::endl;
+  //std::cout << "new(" << alloc_cnt << ") " << e.offset << "~" << e.length << std::endl;
 
   return e;
 }
@@ -37,13 +35,16 @@ AllocEntry TransactionalAllocator::alloc(size_t uint8_ts)
 void TransactionalAllocator::free(const AllocEntry& e)
 {
   alloc_cnt--;
-  std::cout << "del(" << alloc_cnt << ") " << e.offset << std::endl;
+  //std::cout << "del(" << alloc_cnt << ") " << e.offset << std::endl;
   return ::free((void*)e.offset); // FIXME
 }
 
 void TransactionalRoot::replay()
 {
+  // FIXME: check for consistency when failing here!!
+
   set_transactional_root(this);
+  in_transaction = true;
   if (idPrev < idNext) {
 
     // throw away uncommitted part
@@ -77,7 +78,22 @@ void TransactionalRoot::replay()
 
     ++i;
   }
+  in_transaction = false;
   set_transactional_root(nullptr);
+}
+
+int TransactionalRoot::start_read_access()
+{
+  LOCK_READ;
+  readers_count++;
+  return 0;
+}
+
+int TransactionalRoot::stop_read_access()
+{
+  --readers_count;
+  UNLOCK_READ;
+  return 0;
 }
 
 int TransactionalRoot::start_transaction()
@@ -87,6 +103,7 @@ int TransactionalRoot::start_transaction()
   assert(alloc_log_cur == alloc_log_next);
   assert(obj_log_start == obj_log_end);
   set_transactional_root(this);
+  in_transaction = true;
   ++idNext;
 
   return 0;
@@ -95,11 +112,19 @@ int TransactionalRoot::start_transaction()
 int TransactionalRoot::commit_transaction()
 {
   assert(idPrev < idNext);
-  for (auto& d : *objects2release)
-  {
-    d.p->destroy(*this, d.destroy_fn);
+
+  // NB: objects2release might grow during the enumeration
+  for (size_t pos = 0; pos < objects2release->size(); pos++) {
+
+    auto& d = objects2release->at(pos);
+    if (d.destroy_fn) {
+      reinterpret_cast<PObjBase*>(d.p)->destroy(*this, d.destroy_fn);
+    } else {
+      free_persistent_raw(d.p);
+    }
   }
   objects2release->clear();
+  in_transaction = false;
   set_transactional_root(nullptr);
 
   idPrev.store(idNext);
@@ -167,6 +192,5 @@ void PObjBase::operator delete(void* ptr, TransactionalRoot& tr)
 void PObjBase::destroy(TransactionalRoot& tr, dtor destroy_fn)
 {
   destroy_fn(this); // virtual dtor replacement as we can't use virtuals
-                    // operator delete(this, tr);
   operator delete(this, tr);
 }
