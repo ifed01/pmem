@@ -27,7 +27,7 @@ AllocEntry TransactionalAllocator::alloc(size_t uint8_ts)
   e.length = (uint32_t)uint8_ts; // FIXME: adjust length to take service and alignment uint8_ts into account?
 
   alloc_cnt++;
-  //std::cout << "new(" << alloc_cnt << ") " << e.offset << "~" << e.length << std::endl;
+//  std::cout << "new(" << alloc_cnt << ") " << e.offset << "~" << e.length << std::endl;
 
   return e;
 }
@@ -35,7 +35,8 @@ AllocEntry TransactionalAllocator::alloc(size_t uint8_ts)
 void TransactionalAllocator::free(const AllocEntry& e)
 {
   alloc_cnt--;
-  //std::cout << "del(" << alloc_cnt << ") " << e.offset << std::endl;
+  assert(e.length != 0);
+//  std::cout << "del(" << alloc_cnt << ") " << e.offset << "~" << e.length << std::endl;
   return ::free((void*)e.offset); // FIXME
 }
 
@@ -55,17 +56,18 @@ void TransactionalRoot::replay()
       o.obj->recover(o.tid, o.ptr);
       ++obj_log_start;
     }
-    obj_log_end = obj_log_start = 0;
+    obj_log_end = 0;
+    obj_log_start = 0;
     idPrev.store(idPrev);
-  }
-  else {
+  } else {
     assert(idPrev == idNext);
 
     // for sure - they can mismatch but that's safe
     // (see comments in commit_transaction)
     //
     alloc_log_cur = alloc_log_next;
-    obj_log_start = obj_log_end;
+    obj_log_end = 0;
+    obj_log_start = 0;
   }
   auto i = alloc_log_start;
   while (i < alloc_log_next) {
@@ -75,7 +77,6 @@ void TransactionalRoot::replay()
     else {
       allocator.note_alloc(alloc_log[i]);
     }
-
     ++i;
   }
   in_transaction = false;
@@ -118,9 +119,9 @@ int TransactionalRoot::commit_transaction()
 
     auto& d = objects2release->at(pos);
     if (d.destroy_fn) {
-      reinterpret_cast<PObjBase*>(d.p)->destroy(*this, d.destroy_fn);
+      reinterpret_cast<PObjBase*>(d.p)->destroy(*this, d.len, d.destroy_fn);
     } else {
-      free_persistent_raw(d.p);
+      free_persistent_raw(d.p, d.len);
     }
   }
   objects2release->clear();
@@ -136,7 +137,8 @@ int TransactionalRoot::commit_transaction()
 
   // the same handling as above here - ignore the diff if no transaction
   // is in progress
-  obj_log_start = obj_log_end;
+  obj_log_end = 0;
+  obj_log_start = 0;
 
   UNLOCK;
   return 0;
@@ -163,7 +165,8 @@ int TransactionalRoot::rollback_transaction()
     o.obj->recover(o.tid, o.ptr);
     ++obj_log_start;
   }
-  obj_log_end = obj_log_start = 0;
+  obj_log_end = 0;
+  obj_log_start = 0;
   set_transactional_root(nullptr);
 
   idNext.store(idPrev);
@@ -180,17 +183,17 @@ void TransactionalRoot::queue_in_progress(PObjRecoverable* obj, TransactionId ti
   obj_log_end++;
 }
 
-void* PObjBase::operator new(size_t sz, TransactionalRoot& tr)
+void* PObjBase::operator new(size_t sz, TransactionalRoot& tr, size_t dummy)
 {
   return tr.alloc_persistent_raw(sz);
 }
 
-void PObjBase::operator delete(void* ptr, TransactionalRoot& tr)
+void PObjBase::operator delete(void* ptr, TransactionalRoot& tr, size_t len)
 {
-  tr.free_persistent_raw(ptr);
+  tr.free_persistent_raw(ptr, len);
 }
-void PObjBase::destroy(TransactionalRoot& tr, dtor destroy_fn)
+void PObjBase::destroy(TransactionalRoot& tr, size_t len, dtor destroy_fn)
 {
   destroy_fn(this); // virtual dtor replacement as we can't use virtuals
-  operator delete(this, tr);
+  operator delete(this, tr, len);
 }
