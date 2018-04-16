@@ -1,5 +1,5 @@
 #include "persistent_objects.h"
-//#include "allocator.h"
+#include "allocator.h"
 
 #include <iostream>
 #include <stdio.h>
@@ -94,7 +94,13 @@ std::ostream& operator<<(std::ostream& out, const C& c)
     << ")";
 }
 
+void alloc_l1_test();
 int main()
+{
+  alloc_l1_test();
+  return 0;
+}
+/*int main()
 {
   root->init();
 
@@ -580,3 +586,4 @@ int main()
   getchar();
   return 0;
 }
+*/
