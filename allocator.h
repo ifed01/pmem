@@ -79,6 +79,7 @@ class AllocatorLevel01Loose : public AllocatorLevel01
       return res;
     }
     bool end_loop;
+    //FIXME: can benefit from verifying whole slots
     do {
       if ((bits & 1) == 0) {
         ++res_candidate;
@@ -171,6 +172,22 @@ protected:
       for (auto c = 0; c < CHILD_PER_SLOT; c++) {
         switch (slot_val & L1_ENTRY_MASK) {
         case L1_ENTRY_FREE:
+          /*if (prev_pos_partial) {
+            uint64_t l;
+            uint64_t p0, p1;
+            l = _get_longest_from_l0((l1_pos - 1) * l0_w, l1_pos * l0_w, &p0, &p1);
+            l += l0_w * l0_granularity;
+            p1 += l0_w;
+            if (l >= length) {
+              if ((ctx->min_affordable_len == 0) ||
+                ((ctx->min_affordable_len != 0) &&
+                (l - length < ctx->min_affordable_len - length))) {
+                ctx->min_affordable_len = l;
+                ctx->affordable_l0_pos_start = p0;
+                ctx->affordable_l0_pos_end = p1;
+              }
+            }
+          }*/
           prev_pos_partial = false;
           if (!ctx->free_count) {
             ctx->free_l1_pos = l1_pos;
@@ -197,7 +214,7 @@ protected:
           if (l >= length) {
             if ((ctx->min_affordable_len == 0) || 
                ((ctx->min_affordable_len != 0) &&
-                 (l - length < ctx->min_affordable_len - l))) {
+                 (l - length < ctx->min_affordable_len - length))) {
               ctx->min_affordable_len = l;
               ctx->affordable_l0_pos_start = p0;
               ctx->affordable_l0_pos_end = p1;
@@ -234,19 +251,20 @@ protected:
     int64_t l1_pos = pos / l0_w;
     int64_t prev_l1_pos = l1_pos;
 
-    bool was_free_only = true;
-    bool was_partial = false;
+    bool was_all_free = true;
+    bool was_all_set = true;
     bool end_loop;
     do {
       auto& slot_val = l0[pos / CHILD_PER_SLOT_L0];
       pos += CHILD_PER_SLOT_L0;
 
       if (slot_val == all_set_slot_l0) {
-        was_free_only = false;
-      }
-      else if (slot_val != 0) {
-        was_partial = true;
-        was_free_only = false;
+        was_all_free = false;
+      } else if (slot_val == 0) {
+        was_all_set = false;
+      } else {
+        was_all_free = false;
+        was_all_set = false;
         // no need to check the current slot set, it's partial
         pos = p2roundup(pos, l0_w);
       }
@@ -256,13 +274,14 @@ protected:
       if (l1_pos != prev_l1_pos || end_loop) {
         uint64_t shift = (prev_l1_pos % l1_w) * L1_ENTRY_WIDTH;
         l1[prev_l1_pos / l1_w] &= ~(L1_ENTRY_MASK << shift);
-        if (was_partial) {
-          l1[prev_l1_pos / l1_w] |= uint64_t(L1_ENTRY_PARTIAL) << shift;
-        }
-        else if (!was_free_only) {
+        if (was_all_set) {
+          assert(!was_all_free);
           l1[prev_l1_pos / l1_w] |= uint64_t(L1_ENTRY_FULL) << shift;
-        } else {
+        } else if (was_all_free) {
+          assert(!was_all_set);
           l1[prev_l1_pos / l1_w] |= uint64_t(L1_ENTRY_FREE) << shift;
+        } else {
+          l1[prev_l1_pos / l1_w] |= uint64_t(L1_ENTRY_PARTIAL) << shift;
         }
         prev_l1_pos = l1_pos;
       }
