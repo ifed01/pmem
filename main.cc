@@ -95,9 +95,11 @@ std::ostream& operator<<(std::ostream& out, const C& c)
 }
 
 void alloc_l1_test();
+void alloc_l2_test();
 int main()
 {
   alloc_l1_test();
+  alloc_l2_test();
   return 0;
 }
 /*int main()
