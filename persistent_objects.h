@@ -814,7 +814,7 @@ namespace PersistentObjects
   using persistent_list2 = std::list<T, persistent_allocator2<T>>;
 
   template <class K, class V>
-  using persistent_map2 = std::map<K, V, std::less<K>, persistent_allocator2<std::pair<K, V>>>;
+  using persistent_map2 = std::map<K, V, std::less<K>, persistent_allocator2<std::pair<const K, V>>>;
 }; // namespace PersistentObjects
 
 #define PERSISTENT_CLASS_DECL(c) \
