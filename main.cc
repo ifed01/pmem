@@ -1,5 +1,5 @@
 #include "persistent_objects.h"
-#include "allocator.h"
+#include "fastbmap_allocator_impl.h"
 
 #include <iostream>
 #include <stdio.h>
@@ -33,23 +33,33 @@ PERSISTENT_CLASS(B)
 public:
   int n1 = 0, n2 = 0;
   APtr a = nullptr;
-
+  AUniquePtr aa = nullptr;
   B(APtr _a = nullptr) : a(_a)
   {
   }
   PERSISTENT_DEAD
   {
     PERSISTENT_DIE(a);
+    PERSISTENT_DIE(aa);
+
   }
 };
 
 std::ostream& operator<<(std::ostream& out, const B& b)
 {
   out << "B(" << b.n1 << ", " << b.n2 << ", ";
-  const auto *ar = b.a ? b.a->inspect() : nullptr;
+  const auto *ar = !b.a.is_null() ? b.a->inspect() : nullptr;
   if (ar) {
     out << *ar;
   } else {
+    out << "nullptr";
+  }
+  out << ", ";
+  const auto *aar = !b.aa.is_null() ? b.aa.inspect() : nullptr;
+  if (aar) {
+    out << *aar;
+  }
+  else {
     out << "nullptr";
   }
   return out << ")";
@@ -68,16 +78,13 @@ public:
   PERSISTENT_DEAD
   {
     for (auto aptr : av) {
-      if (aptr != nullptr)
-        PERSISTENT_DIE(aptr);
+      PERSISTENT_DIE(aptr);
     }
     for (auto aptr : al) {
-      if (aptr != nullptr)
-        PERSISTENT_DIE(aptr);
+      PERSISTENT_DIE(aptr);
     }
     for (auto bptr : bm) {
-      if (bptr.second != nullptr)
-        PERSISTENT_DIE(bptr.second);
+      PERSISTENT_DIE(bptr.second);
     }
   }
 };
@@ -94,41 +101,62 @@ std::ostream& operator<<(std::ostream& out, const C& c)
     << ")";
 }
 
-void alloc_l1_test();
+/*void alloc_l1_test();
 void alloc_l2_test();
+void alloc_l2_huge_test();
+void alloc_l2_unaligned_test();
 int main()
 {
   alloc_l1_test();
+  alloc_l2_unaligned_test();
   alloc_l2_test();
+  alloc_l2_huge_test();
+  std::cout << ">> Press 'Enter' to proceed..." << std::endl;
+  getchar();
   return 0;
-}
-/*int main()
+}*/
+int main()
 {
   root->init();
 
-  const size_t log_size = 1024;
-  TransactionalRoot tr(log_size);
-  tr.restart();
-  
+  const size_t obj_log_size = 64 * 1024;
+  const size_t alloc_log_size = 64 * 1024;
+  const size_t alloc_log_squeeze_threshold = 32;
+  uint64_t capacity = 1024 * 1024 * 1024;
+  uint32_t min_alloc_unit = MIN_OBJECT_SIZE;
+  assert(min_alloc_unit == 16);
+
+  TransactionRoot* tr_ptr = TransactionRoot::create(capacity);
+  TransactionRoot& tr = *tr_ptr;
+
+  tr.prepare(
+    alloc_log_size,
+    alloc_log_squeeze_threshold,
+    obj_log_size,
+    capacity,
+    min_alloc_unit);
+  std::cout << "alloc log size = " << tr.get_alog_size() << std::endl;
+  std::cout << "available size = " << tr.get_available() << std::endl;
+  assert(tr.get_object_count() == 0);
+
   {
     tr.start_read_access();
     APtr a;
-    assert(a == nullptr);
+    assert(a.is_null());
     tr.stop_read_access();
   }
 
   BPtr b;
-  assert(b == nullptr);
   {
-    assert(b == nullptr);
+    assert(b.is_null());
     tr.start_transaction();
 
     b = BPtr::alloc_persistent_obj<B>(tr);
-    assert(b != nullptr);
+    assert(!b.is_null());
     const B* br0 = b->inspect();
     assert(br0->n1 == 0);
     assert(br0->n2 == 0);
-    assert(br0->a == nullptr);
+    assert(br0->a.is_null());
     B* br = b->access(tr);
     assert(br0 == br); // as we just created b within this transaction
     br->n1++;
@@ -136,7 +164,7 @@ int main()
     br->a = APtr::alloc_persistent_obj<A>(tr, 10);
     assert(br->n1 == 1);
     assert(br->n2 == 3);
-    assert(br->a != nullptr);
+    assert(!br->a.is_null());
     tr.rollback_transaction();
     assert(tr.get_object_count() == 0);
     // since b is not in persistent mem we need to rollback it manually
@@ -145,11 +173,11 @@ int main()
   {
     tr.start_transaction();
     b = BPtr::alloc_persistent_obj<B>(tr);
-    assert(b != nullptr);
+    assert(!b.is_null());
     const B* br0 = b->inspect();
     assert(br0->n1 == 0);
     assert(br0->n2 == 0);
-    assert(br0->a == nullptr);
+    assert(br0->a.is_null());
     B* br = b->access(tr);
     assert(br0 == br); // as we just created b within this transaction
     auto* br2 = b->access(tr); // no op
@@ -160,7 +188,7 @@ int main()
     br->a = APtr::alloc_persistent_obj<A>(tr, 20);
     assert(br->n1 == 5);
     assert(br->n2 == 1);
-    assert(br->a != nullptr);
+    assert(!br->a.is_null());
     tr.commit_transaction();
     assert(tr.get_object_count() != 0);
     {
@@ -168,7 +196,7 @@ int main()
       const B* br0 = b->inspect();
       assert(br0->n1 == 5);
       assert(br0->n2 == 1);
-      assert(br0->a != nullptr);
+      assert(!br0->a.is_null());
       const A* ar0 = br0->a->inspect();
       assert(ar0->n1 == 20);
       assert(ar0->n2 == 20);
@@ -199,7 +227,7 @@ int main()
       const B* br0 = b->inspect();
       assert(br0->n1 == 5);
       assert(br0->n2 == 1);
-      assert(br0->a != nullptr);
+      assert(!br0->a.is_null());
       const A* ar0 = br0->a->inspect();
       assert(ar0->n1 == 20);
       assert(ar0->n2 == 20);
@@ -228,7 +256,7 @@ int main()
       const B* br0 = b->inspect();
       assert(br0->n1 == 50);
       assert(br0->n2 == 2);
-      assert(br0->a != nullptr);
+      assert(!br0->a.is_null());
       const A* ar0 = br0->a->inspect();
       assert(ar0->n1 == 17);
       assert(ar0->n2 == 0);
@@ -252,7 +280,7 @@ int main()
       const B* br0 = b->inspect();
       assert(br0->n1 == 50);
       assert(br0->n2 == 2);
-      assert(br0->a != nullptr);
+      assert(!br0->a.is_null());
       const A* ar0 = br0->a->inspect();
       assert(ar0->n1 == 17);
       assert(ar0->n2 == 0);
@@ -274,7 +302,7 @@ int main()
       const B* br0 = b->inspect();
       assert(br0->n1 == 100);
       assert(br0->n2 == 2);
-      assert(br0->a == nullptr);
+      assert(br0->a.is_null());
       std::cout << *b->inspect() << std::endl;
       tr.stop_read_access();
     }
@@ -283,11 +311,10 @@ int main()
   {
     tr.start_transaction();
     auto* br = b->access(tr);
-    assert(br->a == nullptr);
+    assert(br->a.is_null());
     br->a = APtr::alloc_persistent_obj<A>(tr, 100);
     tr.commit_transaction();
   }
-
   {
     tr.start_transaction();
     b->die(tr);
@@ -297,7 +324,7 @@ int main()
       const B* br0 = b->inspect();
       assert(br0->n1 == 100);
       assert(br0->n2 == 2);
-      assert(br0->a != nullptr);
+      assert(!br0->a.is_null());
       const A* ar0 = br0->a->inspect();
       assert(ar0->n1 == 100);
       assert(ar0->n2 == 100);
@@ -307,13 +334,50 @@ int main()
     }
   }
   {
+    // trying access child without updating master obj
+    tr.start_transaction();
+    const B* br0 = b->inspect();
+    auto ar = br0->a->access(tr);
+    ar->n1 = 123;
+    ar->n2 = 234;
+    strncpy(ar->s, "test data123", sizeof(ar->s));
+    tr.commit_transaction();
+    tr.start_read_access();
+    std::cout << *b->inspect() << std::endl;
+    tr.stop_read_access();
+  }
+  {
+    // allocate unique ptr
+    // note "aa->allocate_obj" invocation which causes const_cast
+    // via PUniquePtr::operator-> implementation
+    tr.start_transaction();
+    b->inspect()->aa->allocate_obj(tr, 200);
+    tr.commit_transaction();
+
+    //access unique ptr without updating master obj,
+    // note "aa->access" invocation which causes const_cast
+    // via PUniquePtr::operator-> implementation
+    tr.start_transaction();
+    auto aar = b->inspect()->aa->access(tr);
+    aar->n1 *= 300;
+    tr.commit_transaction();
+    tr.start_read_access();
+    std::cout << *b->inspect() << std::endl;
+    tr.stop_read_access();
+  }
+  {
     tr.start_transaction();
     b->die(tr);
     tr.commit_transaction();
   }
   b = nullptr;
+  std::cout << "alloc log size = " << tr.get_alog_size() << std::endl;
+  std::cout << "available size = " << tr.get_available() << std::endl;
+  std::cout << "obj count = " << tr.get_object_count() << std::endl;
   assert(tr.get_object_count() == 0);
 
+  tr.restart();
+  assert(tr.get_object_count() == 0);
 
   CPtr c = nullptr;
   {
@@ -331,7 +395,6 @@ int main()
     c = nullptr;
   }
   assert(tr.get_object_count() == 0);
-
   {
     tr.start_transaction();
     c = CPtr::alloc_persistent_obj<C>(tr);
@@ -353,17 +416,17 @@ int main()
       assert(cr0->a == 1);
       assert(cr0->b == 1);
       assert(cr0->al.size() == 1);
-      assert(cr0->al.front() == nullptr);
+      assert(cr0->al.front().is_null());
       assert(cr0->il.size() == 1);
       assert(cr0->il.front() == 9123);
       assert(cr0->av.size() == 1);
-      assert(cr0->av[0] == nullptr);
+      assert(cr0->av[0].is_null());
       assert(cr0->iv.size() == 1);
       assert(cr0->iv[0] == 9321);
       assert(cr0->im.size() == 1);
       assert(cr0->im.at(1) == 9333);
       assert(cr0->bm.size() == 1);
-      assert(cr0->bm.at(1) == nullptr);
+      assert(cr0->bm.at(1).is_null());
       assert(cr0->im.find(0) == cr0->im.end());
       assert(cr0->im.find(1)->second == 9333);
       assert(cr0->bm.size() == 1);
@@ -400,18 +463,18 @@ int main()
       assert(cr0->a == 1);
       assert(cr0->b == 1);
       assert(cr0->al.size() == 1);
-      assert(cr0->al.front() == nullptr);
+      assert(cr0->al.front().is_null());
       assert(cr0->il.size() == 1);
       assert(cr0->il.front() == 9123);
 
       assert(cr0->av.size() == 1);
-      assert(cr0->av[0] == nullptr);
+      assert(cr0->av[0].is_null());
       assert(cr0->iv.size() == 1);
       assert(cr0->iv[0] == 9321);
       assert(cr0->im.size() == 1);
       assert(cr0->im.at(1) == 9333);
       assert(cr0->bm.size() == 1);
-      assert(cr0->bm.at(1) == nullptr);
+      assert(cr0->bm.at(1).is_null());
       assert(cr0->im.find(0) == cr0->im.end());
       assert(cr0->im.find(1)->second == 9333);
       assert(cr0->bm.size() == 1);
@@ -426,7 +489,7 @@ int main()
     auto* cr = c->access(tr);
     cr->a++;
     cr->b++;
-
+    
     cr->av.resize(2);
     cr->av[0] = APtr::alloc_persistent_obj<A>(tr, 55);
     cr->av[1] = APtr::alloc_persistent_obj<A>(tr, 56);
@@ -447,7 +510,7 @@ int main()
       APtr::alloc_persistent_obj<A>(tr, 60));
     cr->bm[2]->access(tr)->n1 = 61;
     cr->bm[2]->access(tr)->a->access(tr)->n1 = 62;
-
+    
     tr.commit_transaction();
     {
       tr.start_read_access();
@@ -456,7 +519,7 @@ int main()
       assert(cr0->b == 2);
 
       assert(cr0->al.size() == 2);
-      assert(cr0->al.front() == nullptr);
+      assert(cr0->al.front().is_null());
       assert(cr0->al.back()->inspect()->n1 == 58);
 
       assert(cr0->il.size() == 2);
@@ -479,7 +542,7 @@ int main()
       assert(cr0->im.find(100)->second == 100);
 
       assert(cr0->bm.size() == 2);
-      assert(cr0->bm.at(1) == nullptr);
+      assert(cr0->bm.at(1).is_null());
       assert(cr0->bm.at(2)->inspect()->n1 == 61);
       assert(cr0->bm.at(2)->inspect()->a->inspect()->n1 == 62);
       assert(cr0->bm.find(0) == cr0->bm.end());
@@ -489,7 +552,6 @@ int main()
       tr.stop_read_access();
     }
   }
-
   {
     tr.start_transaction();
     auto* cr = c->inspect();
@@ -498,14 +560,19 @@ int main()
     br->n2 += 20;
     auto *ar = br->a->access(tr);
     ar->n1 += 30;
+    //tr.rollback_transaction();
+    std::cout << "alloc log size = " << tr.get_alog_size() << std::endl;
+    std::cout << "available size = " << tr.get_available() << std::endl;
+    tr.restart();
 
-    tr.rollback_transaction();
+    std::cout << "alloc log size = " << tr.get_alog_size() << std::endl;
+    std::cout << "available size = " << tr.get_available() << std::endl;
     {
       tr.start_read_access();
       const C* cr0 = c->inspect();
 
       assert(cr0->bm.size() == 2);
-      assert(cr0->bm.at(1) == nullptr);
+      assert(cr0->bm.at(1).is_null());
       assert(cr0->bm.at(2)->inspect()->n1 == 61);
       assert(cr0->bm.at(2)->inspect()->n2 == 0);
       assert(cr0->bm.at(2)->inspect()->a->inspect()->n1 == 62);
@@ -527,7 +594,7 @@ int main()
       const C* cr0 = c->inspect();
 
       assert(cr0->bm.size() == 2);
-      assert(cr0->bm.at(1) == nullptr);
+      assert(cr0->bm.at(1).is_null());
       assert(cr0->bm.at(2)->inspect()->n1 == 71);
       assert(cr0->bm.at(2)->inspect()->n2 == 20);
       assert(cr0->bm.at(2)->inspect()->a->inspect()->n1 == 92);
@@ -535,45 +602,49 @@ int main()
       tr.stop_read_access();
     }
   }
-
   {
     tr.start_transaction();
-    auto* cr = c->access(tr);
+    auto* cr = c->inspect();
     std::cout << "C content prior to release:" << std::endl;
     std::cout << *cr << std::endl;
 
     c->die(tr);
     tr.commit_transaction();
   }
+  std::cout << "alloc log size = " << tr.get_alog_size() << std::endl;
+  std::cout << "available size = " << tr.get_available() << std::endl;
   std::cout << tr.get_object_count() << std::endl;
-  assert(tr.get_object_count() == 0);
+  assert(tr.get_object_count() == 0);                                                                                              
 
   // volatile pointers demo
   VPtr<int> v = new int(777);
-  if (v != nullptr)
+  if (!v.is_null())
     std::cout << "*v = " << *v << std::endl;
   else
     std::cout << "v is null" << std::endl;
 
   // this simulates process restart hence invalidating volatile pointers
+  tr.shutdown();
   root->restart();
+  tr.restart();
+
   VPtr<int> v2(v);
-  if (v != nullptr)
+  if (!v.is_null())
     std::cout << "*v = " << *v << std::endl;
   else
     std::cout << "v is null" << std::endl;
-  if (v2 != nullptr)
+  if (!v2.is_null())
     std::cout << "*v2 = " << *v2 << std::endl;
   else
     std::cout << "v2 is null" << std::endl;
 
   v.reset(new int(779));
-  if (v != nullptr)
+  if (!v.is_null())
     std::cout << "*v = " << *v << std::endl;
   else
     std::cout << "v is null" << std::endl;
   v2 = v;
-  if (v2 != nullptr)
+  if (!v2.is_null())
     std::cout << "*v2 = " << *v2 << std::endl;
   else
     std::cout << "v2 is null" << std::endl;
@@ -583,9 +654,11 @@ int main()
 //  offset_ptr<int> p(&aaa);
 //  *p = 3;
 //  std::cout << " aaa = " << *p << " " << aaa << std::endl;
-
+  std::cout << "alloc log size = " << tr.get_alog_size() << std::endl;
+  std::cout << "available size = " << tr.get_available() << std::endl;
+  std::cout << "object count = " << tr.get_object_count() << std::endl;
   std::cout << ">> Press 'Enter' to proceed..." << std::endl;
   getchar();
+  TransactionRoot::destroy(tr_ptr);
   return 0;
 }
-*/

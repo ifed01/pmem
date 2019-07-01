@@ -18,9 +18,10 @@
 using namespace boost::interprocess;
 #endif
 
+#include "fastbmap_allocator_impl.h"
+
 namespace PersistentObjects
 {
-  //using namespace std;
   struct AllocEntry
   {
     uint64_t offset = 0;
@@ -28,67 +29,87 @@ namespace PersistentObjects
     AllocEntry() {}
     AllocEntry(uint64_t o, uint32_t l) : offset(o), length(l) {}
   };
-  class TransactionalAllocator
+  class TransactionAllocator : public AllocatorLevel02<AllocatorLevel01Loose>
   {
-    size_t alloc_cnt = 0;
+    uint64_t capacity = 0;
   public:
+    bool initialized() const {
+      return capacity != 0;
+    }
+    void init(uint64_t size, uint32_t alloc_unit, uint32_t prealloc_size) {
+      assert(!initialized()); // duplicate init check
+      assert(prealloc_size % alloc_unit == 0);
+     _init(size, alloc_unit);
+     capacity = size;
+     AllocEntry first(0, prealloc_size);
+     note_alloc(first);
+    }
+    void shutdown() {
+      capacity = 0;
+      _shutdown();
+    }
+
     AllocEntry alloc(size_t uint8_ts);
+    uint64_t alloc(size_t uint8_ts, size_t min_size, bufferlist& res);
     void free(const AllocEntry& e);
-    void note_alloc(const AllocEntry& e)
-    {
-    }
-    void apply_release(const AllocEntry& e)
-    {
-      // FIXME
-    }
-    size_t get_alloc_count() const
-    {
-      return alloc_cnt;
+    void free(const bufferlist& to_release);
+    void note_alloc(const AllocEntry& e);
+    void apply_release(const AllocEntry& e);
+
+    uint64_t get_capacity() const {
+      return capacity;
     }
   };
 
   typedef uint64_t TransactionId;
-  class TransactionalRoot;
+  class TransactionRoot;
 
   typedef void(*dtor)(const void*);
 
   struct PObjBase
   {
-    void* operator new(size_t sz, TransactionalRoot& tr, size_t dummy);
-    void operator delete(void* p, TransactionalRoot&, size_t len);
-    void destroy(TransactionalRoot& tr, size_t len, dtor destroy_fn);
+    void* operator new(size_t sz, TransactionRoot& tr, size_t dummy);
+    void operator delete(void* p, TransactionRoot&, size_t len);
+    void destroy(TransactionRoot& tr, size_t len, dtor destroy_fn);
   };
   struct PObjBaseDestructor
   {
-    void* p = nullptr; // this is PObjBase if destroy_fn != null and void* overwise
+    void* p = nullptr; // this is PObjBase if destroy_fn != null and persisgtent offset overwise
     dtor destroy_fn = nullptr;
     size_t len = 0;
-    PObjBaseDestructor(void* _p, size_t _len, dtor _destroy_fn) :
+    PObjBaseDestructor(PObjBase* _p, size_t _len, dtor _destroy_fn) :
       p(_p), destroy_fn(_destroy_fn), len(_len) {
+      assert(destroy_fn != nullptr);
+    }
+    PObjBaseDestructor(uint64_t _o, size_t _len) :
+      p(reinterpret_cast<void*>(_o)), destroy_fn(nullptr), len(_len) {
     }
   };
 
   struct PObjRecoverable : public PObjBase
   {
     TransactionId tid = 0;
-    void* ptr = nullptr;
+    uint64_t offs = 0;
 
-    void recover(TransactionId _tid, void* _ptr)
+    void recover(TransactionId _tid, uint64_t _offs)
     {
       tid = _tid;
-      ptr = _ptr;
+      offs = _offs;
     }
   };
 
-  template <class T>
+  const uint64_t MIN_OBJECT_SIZE = sizeof(PObjRecoverable);
+  const size_t ALLOC_SNAPSHOT_PAGE = 4096;
+  const uint32_t TR_ROOT_PREALLOC_SIZE = 64 * 1024;
+  /*template <class T>
   T* alloc_persistent(size_t size = 1) {
     return new T[size];
-  }
+  } */
 
-  extern thread_local TransactionalRoot* working_transactional_root;
+  extern thread_local TransactionRoot* working_Transaction_root;
   // this should be applied every time we start processing transaction within
   // a specific thread
-  void set_transactional_root(TransactionalRoot* tr);
+  void set_Transaction_root(TransactionRoot* tr);
 
   struct PersistencyRoot
   {
@@ -102,7 +123,7 @@ namespace PersistentObjects
     void restart()
     {
       // FIXME: this should be mapped to mmap result?
-      base = 0;
+      //base = 0;
       ++runId;
     }
   };
@@ -110,11 +131,24 @@ namespace PersistentObjects
   // FIXME: in fact we need to obtain that root from persistent store(pool)
   extern PersistencyRoot* root;
   template <class T>
+  uint64_t ptr2poffs(T* ptr) {
+    uint64_t offs = reinterpret_cast<uint64_t>(ptr);
+    assert(offs > root->base);
+    offs -= root->base;
+    return offs;
+  }
+  template <class T>
+  T* poffs2ptr(uint64_t offs) {
+    return reinterpret_cast<T*>(offs + root->
+      base);
+  }
+  template <class T>
   class VPtr
   {
     uint64_t runId = 0;
     T* ptr = nullptr;
   public:
+    VPtr() {}
     VPtr(T* p) : runId(root->runId), ptr(p)
     {
     }
@@ -124,6 +158,10 @@ namespace PersistentObjects
         runId = from.runId;
         ptr = from.ptr;
       }
+    }
+    // for the sake of feature parity with PPtr
+    inline bool is_null() const {
+      return (runId != root->runId || ptr == nullptr);
     }
     operator T*()
     {
@@ -161,44 +199,304 @@ namespace PersistentObjects
     }
   };
 
-  class TransactionalRoot
+  class PBuffer : public PObjRecoverable
   {
-    std::atomic<TransactionId> idPrev;
-    std::atomic<TransactionId> idNext;
+    size_t len = 0;
+  public:
+    PBuffer() {
+    }
+    ~PBuffer() {
+    }
+    bool is_null() const {
+      return offs == 0;
+    }
+    //non-Transaction set
+    void setup_initial(TransactionId _tid, uint64_t _offs, size_t _len) {
+      tid = _tid;
+      offs = _offs;
+      len = _len;
+    }
+    void setup_new(TransactionRoot& t, uint64_t offs, size_t new_size);
+    inline void* get() const {
+      assert(tid != 0 && offs);
+      return poffs2ptr<void*>(offs);
+    }
+    inline const uint8_t* inspect() const {
+      assert(tid != 0 && offs);
+      return poffs2ptr<uint8_t>(offs);
+    }
+    inline void die(TransactionRoot& t);
+  };
+  template <class T>
+  class PObj : public PObjRecoverable
+  {
+  protected:
+    inline T* _get() const {
+      assert(tid != 0 && offs);
+      return reinterpret_cast<T*>(offs + root->base);
+    }
+  public:
+    PObj(nullptr_t)
+    {
+    }
+    PObj(TransactionRoot& t);
+    PObj(TransactionId _tid, T* _ptr)
+    {
+      tid = _tid;
+      offs = ptr2poffs<T>(_ptr);
+    }
+    inline const T* operator->() const {
+      return _get();
+    }
+    operator const T&() const
+    {
+      return *_get()();
+    }
+
+    inline const T* inspect() const {
+      return _get();
+    }
+    inline T* access(TransactionRoot& t);
+    bool is_null() const {
+      return offs == 0;
+    }
+    inline void die(TransactionRoot& t);
+  };
+  template <class T>
+  class PUniquePtr : public PObj<T>
+  {
+    size_t len = 0;
+  public:
+    PUniquePtr() : PObj<T>(nullptr)
+    {
+    }
+    PUniquePtr(nullptr_t) : PObj<T>(nullptr)
+    {
+    }
+    //non-Transaction set
+    void setup_initial(TransactionId _tid, uint64_t _offs, size_t _len = 0) {
+      PObj<T>::tid = _tid;
+      PObj<T>::offs = _offs;
+      len = _len;
+    }
+
+    inline void setup(TransactionRoot& t, const AllocEntry& a);
+    
+    template <typename... Args>
+    void allocate_obj(TransactionRoot& tr, Args&&... args);
+    inline void die(TransactionRoot& t);
+/*    T* operator->() {
+      return _get();
+    }*/
+    operator T&() {
+      return *PObj<T>::_get();
+    }
+    operator const T&() const {
+      return *PObj<T>::_get();
+    }
+
+    // a doubtful hack to provide non-const access
+    // intended to permit modification (i.e. access call) without 
+    // "accessing" the owner
+    PUniquePtr<T>* operator->() const {
+      return const_cast<PUniquePtr<T>*>(this);
+    }
+  };
+
+  class TransactionRoot
+  {
+    std::atomic<TransactionId> idPrev = { 0 };
+    std::atomic<TransactionId> idNext = { 0 };
 
     struct AllocLogEntry : public AllocEntry
     {
       enum {
         RELEASE_FLAG = 1,
+        INIT_FLAG = 2,
       };
       uint32_t flags;
       inline bool is_release() const {
         return flags & RELEASE_FLAG;
       }
+      inline bool is_init() const {
+        return flags & INIT_FLAG;
+      }
+      void set(const AllocEntry& e, uint32_t _flags) {
+        offset = e.offset;
+        length = e.length;
+        flags = _flags;
+      }
+      void set(uint64_t offs, uint32_t len, uint32_t _flags) {
+        offset = offs;
+        length = len;
+        flags = _flags;
+      }
+    };
+    template <class Log, class Entry>
+    class LogIteratorProto
+    {
+      size_t pos = 0;
+      Log& log;
+    public:
+      LogIteratorProto(Log& _log, size_t _pos) : log(_log), pos(_pos) {
+      }
+      Entry* operator->() {
+        return &log.at(pos);
+      }
+      Entry& operator*() {
+        return log.at(pos);
+      }
+      bool operator!=(const LogIteratorProto& other) const {
+        return pos != other.pos;
+      }
+      void operator++() {
+        pos++;
+      }
     };
 
-    size_t alloc_log_size = 0;
-    AllocLogEntry* alloc_log = nullptr;
-    size_t alloc_log_start = 0;
-    size_t alloc_log_cur = 0;
-    size_t alloc_log_next = 0;
-    TransactionalAllocator allocator;
-    std::atomic<int> readers_count;
-    bool in_transaction = false;
+    class AllocationLog : public PObjBase {
+      size_t alloc_log_size = 0;
+      size_t alloc_log_start = 0; // needful?
+      size_t alloc_log_cur = 0;
+      size_t alloc_log_next = 0;
+      size_t alloc_log_base_cnt = 0;
+      uint64_t snapshot_alloc_cnt = 0;
+      size_t snapshot_blist_size = 0;
+      PBuffer snapshot_bufferlist;
+      AllocLogEntry log[1];
+    public:
+      typedef LogIteratorProto<AllocationLog, AllocLogEntry> Iterator;
+      Iterator start() {
+        return Iterator(*this, alloc_log_start);
+      }
+      Iterator cur() {
+        return Iterator(*this, alloc_log_cur);
+      }
+      Iterator end() {
+        return Iterator(*this, alloc_log_next);
+      }
+      static AllocEntry create_new(TransactionId tid,
+                                        TransactionAllocator& alloc,
+                                        const AllocLogEntry& first,
+                                        size_t log_size) {
+        auto alloc_cnt0 = alloc.get_alloc_count();
+        // NB: adjust by - 1 as sizeof(AllocationLog) takes one into account
+        auto buf_size = (log_size - 1) * sizeof(AllocLogEntry);
+        buf_size += sizeof(AllocationLog);
+        AllocEntry self = alloc.alloc(buf_size);
+        assert(self.length >= buf_size);
+        AllocationLog* alog = poffs2ptr<AllocationLog>(self.offset);
+
+        alog->alloc_log_size = log_size;
+        alog->alloc_log_start = alog->alloc_log_cur = alog->alloc_log_next = 0;
+        alog->alloc_log_base_cnt = alloc.get_alloc_count() - alloc_cnt0;
+        alog->snapshot_blist_size = 0;
+        alog->snapshot_alloc_cnt = 0;
+        alog->snapshot_bufferlist.setup_initial(tid, 0, 0);
+        alog->next() = first;
+        alog->next().set(self, 0);
+        alog->commit();
+        return self;
+      }
+      void die(TransactionRoot& t);
+
+      void apply_allocator_snapshot(TransactionAllocator& alloc);
+
+      AllocEntry squeeze(TransactionRoot& t, TransactionAllocator& alloc);
+      AllocLogEntry& at(size_t i) {
+        assert(i < alloc_log_next);
+        return *(log + i);
+      }
+      AllocLogEntry& next() {
+        return log[alloc_log_next++];
+      }
+      bool committed() const {
+        return alloc_log_cur == alloc_log_next;
+      }
+      void commit() {
+        alloc_log_cur = alloc_log_next;
+      }
+      void rollback() {
+        alloc_log_next = alloc_log_cur;
+      }
+      size_t get_log_size() const {
+        return alloc_log_next - alloc_log_start;
+      }
+      size_t get_base_cnt() const {
+        return alloc_log_base_cnt;
+      }
+    };
+    PUniquePtr <AllocationLog> alloc_log;
+    size_t alloc_base_cnt = 0;
+    size_t alog_squeeze_threshold = 0;
+    VPtr<TransactionAllocator> allocator;
+
+    std::atomic<int> readers_count; // debug only
+    bool in_transaction = false; // debug only
 
     struct ObjLogEntry
     {
-      PObjRecoverable* obj = nullptr;
+      uint64_t obj_offs = 0;
       TransactionId tid = 0;
-      void* ptr = nullptr;
+      uint64_t offs = 0;
       ObjLogEntry() {}
-      ObjLogEntry(PObjRecoverable* _obj, TransactionId _tid, void* _ptr)
-        : obj(_obj), tid(_tid), ptr(_ptr) {}
+      ObjLogEntry(uint64_t _obj_offs, TransactionId _tid, uint64_t _offs)
+        : obj_offs(_obj_offs), tid(_tid), offs(_offs) {}
     };
-    ObjLogEntry* obj_log = nullptr;
-    size_t obj_log_size = 0;
-    size_t obj_log_start = 0;
-    size_t obj_log_end = 0;
+
+    class ObjectLog {
+      PBuffer buf;
+      size_t obj_log_size = 0;
+      size_t obj_log_base_cnt = 0;
+      size_t obj_log_start = 0; // needful?
+      size_t obj_log_end = 0;
+
+    public:
+      typedef LogIteratorProto<ObjectLog, ObjLogEntry> Iterator;
+      Iterator start() {
+        return Iterator(*this, obj_log_start);
+      }
+      Iterator end() {
+        return Iterator(*this, obj_log_end);
+      }
+      void prepare(TransactionId tid,
+        TransactionAllocator& alloc,
+        AllocationLog& alog,
+        size_t log_size) {
+        assert(obj_log_size == 0);
+        auto alloc_cnt0 = alloc.get_alloc_count();
+        auto buf_size = log_size * sizeof(ObjLogEntry);
+        AllocEntry self = alloc.alloc(buf_size);
+        assert(self.length == buf_size);
+        buf.setup_initial(tid,
+          self.offset,
+          self.length);
+        obj_log_size = log_size;
+        obj_log_start = obj_log_end = 0;
+        obj_log_base_cnt = alloc.get_alloc_count() - alloc_cnt0;
+        auto& alog_entry = alog.next();
+        alog_entry.set(self, 0);
+        alog.commit();
+      }
+      ObjLogEntry& at(size_t i) const {
+        assert(i < obj_log_end);
+        return (reinterpret_cast<ObjLogEntry*>(buf.get()))[i];
+      }
+      void push_back(const ObjLogEntry& e) {
+        assert(obj_log_end < obj_log_size);
+        (reinterpret_cast<ObjLogEntry*>(buf.get()))[obj_log_end] = e;
+        ++obj_log_end;
+      }
+      bool empty() const {
+        return obj_log_start == obj_log_end;
+      }
+      void reset() {
+        obj_log_end = obj_log_start;
+      }
+      uint64_t get_base_cnt() const {
+        return obj_log_base_cnt;
+      }
+    } obj_log;
 
     std::vector<PObjBaseDestructor>* objects2release = nullptr;
     std::shared_mutex* lock = nullptr;
@@ -210,27 +508,92 @@ namespace PersistentObjects
 
   public:
 
-    //FIXME: minor - different log sizes?
-    TransactionalRoot(size_t _log_size) : idNext(1), idPrev(1),
-      alloc_log_size(_log_size), obj_log_size(_log_size)
-    {
-      alloc_log = alloc_persistent<AllocLogEntry>(_log_size);
-      obj_log = alloc_persistent<ObjLogEntry>(_log_size);
-    }
-    ~TransactionalRoot()
+    ~TransactionRoot()
     {
       assert(!in_transaction);
+      //FIXME: different implementation when root is persistent?
+      //free((void*)root->base);
+      //root->base = 0;
       delete objects2release;
       delete lock;
+    }
+
+    static TransactionRoot* create(uint64_t capacity)
+    {
+      assert(root->base == 0);
+      root->base = (uint64_t)malloc(capacity); // FIXME: access and allocate PMem. Do mmap?
+      assert(root->base != 0);
+      TransactionRoot* res = new ((void*)root->base) TransactionRoot;
+      return res;
+    }
+    static void destroy(TransactionRoot* tr)
+    {
+      assert(root->base != 0);
+      tr->~TransactionRoot();
+      free((void*)root->base);
+      root->base = 0;
+    }
+
+    void prepare(size_t _alloc_log_size,
+      size_t _alog_squeeze_threshold,
+      size_t _obj_log_size,
+      uint64_t capacity,
+      uint32_t min_alloc_unit)
+    {
+      assert(idNext == 0);
+      assert(idNext == idPrev);
+      idNext = idPrev = 1;
+
+      objects2release = new std::remove_pointer<decltype(objects2release)>::type;
+      lock = new std::shared_mutex();
+
+      allocator = new TransactionAllocator();
+      allocator->init(capacity, min_alloc_unit, TR_ROOT_PREALLOC_SIZE);
+      alloc_base_cnt = allocator->get_alloc_count();
+      alog_squeeze_threshold = _alog_squeeze_threshold;
+
+      AllocLogEntry first;
+      first.flags = AllocLogEntry::INIT_FLAG;
+      first.offset = capacity;
+      first.length = min_alloc_unit;
+      //auto allocs0 = allocator.get_alloc_count();
+      AllocEntry alog_entry = AllocationLog::create_new(
+        idNext,
+        *allocator,
+        first,
+        _alloc_log_size);
+      alloc_log.setup_initial(idNext, alog_entry.offset, alog_entry.length);
+      obj_log.prepare(idNext, *allocator, alloc_log, _obj_log_size);
+    }
+    void shutdown() {
+      // reset volatile members, assuming they might exist, e.g. if we simulate restart
+      delete objects2release;
+      objects2release = nullptr;
+      delete lock;
+      lock = nullptr;
+      if (allocator) {
+        allocator->shutdown();
+        delete (TransactionAllocator*)allocator;
+        allocator = nullptr;
+      }
     }
     // indicates instance restart
     void restart()
     {
-      // reset volatile members
+
+      //FIXME: we'll need to reset root base here once real PM is used 
+      /*if (root->base != 0) {
+        free((void*)root->base);
+        root->base = 0;
+      } */
+      shutdown();
       objects2release = new std::remove_pointer<decltype(objects2release)>::type;
       lock = new std::shared_mutex();
+      allocator = new TransactionAllocator;
 
       replay();
+
+      assert(root->base != 0);
     }
 
     inline TransactionId get_effective_id() const {
@@ -241,24 +604,23 @@ namespace PersistentObjects
     }
     void replay();
 
-    void* alloc_persistent_raw(size_t uint8_ts)
+    uint64_t alloc_persistent_raw(size_t uint8_ts)
     {
       // permit within transaction scope only
       assert(in_transaction);
-      AllocLogEntry& e = alloc_log[alloc_log_next++];
-      (AllocEntry&)e = allocator.alloc(uint8_ts);
-      e.flags = 0;
-      return (void*)e.offset;
+      AllocLogEntry& e = ((AllocationLog&)alloc_log).next();
+      e.set(allocator->alloc(uint8_ts), 0);
+      return e.offset;
     }
-    void free_persistent_raw(void* ptr, size_t len)
+    void free_persistent_raw(uint64_t offs, size_t len)
     {
       // permit within transaction scope only
       assert(in_transaction);
-      AllocLogEntry& e = alloc_log[alloc_log_next++];
-      e.flags = AllocLogEntry::RELEASE_FLAG;
-      e.offset = (uint64_t)ptr;
-      e.length = (uint32_t)len;
-      allocator.free(e);
+      AllocLogEntry& e = ((AllocationLog&)alloc_log).next();
+      e.set(offs,
+            (uint32_t)len,
+            AllocLogEntry::RELEASE_FLAG);
+      allocator->free(e);
     }
 
     int start_read_access();
@@ -273,82 +635,125 @@ namespace PersistentObjects
     {
       objects2release->emplace_back(t, len, destroy_fn);
     }
-    void queue_for_release(void* t, size_t len)
+    void queue_for_release(uint64_t offs, size_t len)
     {
-      objects2release->emplace_back(t, len, nullptr);
+      objects2release->emplace_back(offs, len);
     }
-    void queue_in_progress(PObjRecoverable* obj, TransactionId tid, void* ptr);
-    size_t get_object_count() const
+    void queue_in_progress(PObjRecoverable* obj, TransactionId tid, uint64_t offs);
+    size_t get_object_count()
     {
-      return allocator.get_alloc_count();
+      return allocator->get_alloc_count() -
+        ((const AllocationLog&)alloc_log).get_base_cnt() -
+        obj_log.get_base_cnt() - 
+        alloc_base_cnt;
+    }
+    uint64_t get_available() {
+      return allocator->get_available();
+    }
+    size_t get_alog_size() const {
+      return ((const AllocationLog&)alloc_log).get_log_size();
     }
   };
 
   template <class T>
-  class PObj : public PObjRecoverable
+  PObj<T>::PObj(TransactionRoot& t)
   {
-  public:
-    PObj(TransactionalRoot& t)
-    {
-      tid = t.get_effective_id();
-      ptr = new (t) T();
-    }
-    PObj(TransactionId _tid, T* _ptr)
-    {
-      tid = _tid;
-      ptr = _ptr;
-    }
-    // just an alias for inspect()
-    inline const T* operator->() const {
-      return inspect();
-    }
-    operator const T&() const
-    {
-      return *inspect();
-    }
+    tid = t.get_effective_id();
+    void* ptr = new (t) T();
+    offs = ptr2poffs<T>(ptr);
+  }
 
-    inline const T* inspect() const {
-      assert(tid != 0 && ptr);
-      return reinterpret_cast<const T*>(ptr);
-    }
-    inline T* access(TransactionalRoot& t) {
-      assert(tid != 0 && ptr);
-      auto _tid = t.get_effective_id();
-      if (_tid == tid)
-        return reinterpret_cast<T*>(ptr);
+  template <class T>
+  T* PObj<T>::access(TransactionRoot& t) {
+    assert(tid != 0 && offs);
+    auto _tid = t.get_effective_id();
+    if (_tid == tid)
+      return _get();
 
-      // duplicate
-      t.queue_in_progress(this, tid, reinterpret_cast<T*>(ptr));
-      //t.queue_for_release(reinterpret_cast<T*>(ptr));
-      t.queue_for_release(static_cast<T*>(ptr), sizeof(T), [](const void* x) {
+    // duplicate
+    t.queue_in_progress(this, tid, offs);
+    t.queue_for_release(_get(), sizeof(T), [](const void* x) {
+      static_cast<const T*>(x)->~T(); });
+
+    tid = _tid;
+    T* ptr = new (t, 0) T(*_get());
+    offs = ptr2poffs<T>(ptr);
+    return ptr;
+  }
+
+  template <class T>
+  inline void PObj<T>::die(TransactionRoot& t) {
+    assert(offs);
+    t.queue_in_progress(this, tid, offs);
+    t.queue_for_release(this,
+      sizeof(*this), [](const void* x) {
+      static_cast<const PObj<T>*>(x)->~PObj<T>(); });
+    t.queue_for_release(_get(), sizeof(T), [](const void* x) {
+      static_cast<const T*>(x)->~T(); });
+
+    // dtor simulation.
+    // we can probably get rid off it by enforcing ref_counted ptr usage
+    // inside persisent objects
+    _get()->die(t);
+
+    tid = 0;
+    offs = 0;
+  }
+ 
+  template <class T>
+  void PUniquePtr<T>::setup(TransactionRoot& t, const AllocEntry& a) {
+    auto _tid = t.get_effective_id();
+    assert(_tid != PObj<T>::tid);
+
+    t.queue_in_progress(this, PObj<T>::tid, PObj<T>::offs);
+    if (!PObj<T>::is_null()) {
+      t.queue_for_release(PObj<T>::_get(), len ? len : sizeof(T), [](const void* x) {
         static_cast<const T*>(x)->~T(); });
 
-      tid = _tid;
-      ptr = new (t, 0) T(*reinterpret_cast<T*>(ptr));
-      return reinterpret_cast<T*>(ptr);
+      PObj<T>::_get()->die(t);
     }
-    inline void die(TransactionalRoot& t) {
-      assert(ptr);
-      t.queue_in_progress(this, tid, reinterpret_cast<T*>(ptr));
-      t.queue_for_release(this, sizeof(*this), [](const void* x) {
-        static_cast<const PObj<T>*>(x)->~PObj<T>(); });
-      t.queue_for_release(static_cast<T*>(ptr), sizeof(T), [](const void* x) {
-        static_cast<const T*>(x)->~T(); });
 
-      // dtor simulation.
-      // we can probably get rid off it by enforcing ref_counted ptr usage
-      // inside persisent objects
-      reinterpret_cast<T*>(ptr)->die(t);
+    PObj<T>::tid = _tid;
+    PObj<T>::offs = a.offset;
+    len = a.length;
 
-      tid = 0;
-      ptr = nullptr;
+    return;
+  }
+
+  template <class T>
+  template <typename... Args>
+  void PUniquePtr<T>::allocate_obj(TransactionRoot& tr, Args&&... args) {
+    T* t = new (tr, 0) T(args...);
+    PObj<T>::tid = tr.get_effective_id();
+    PObj<T>::offs = ptr2poffs(t);
+  }
+  template <class T>
+  void PUniquePtr<T>::die(TransactionRoot& t) {
+    if (!PObj<T>::offs) {
+      return;
     }
-  };
+    t.queue_in_progress(this, PObj<T>::tid, PObj<T>::offs);
+    t.queue_for_release(PObj<T>::_get(), len ? len : sizeof(T), [](const void* x) {
+      static_cast<const T*>(x)->~T(); });
+
+    // dtor simulation.
+    // we can probably get rid off it by enforcing ref_counted ptr usage
+    // inside persisent objects
+    PObj<T>::_get()->die(t);
+
+    PObj<T>::tid = 0;
+    PObj<T>::offs = 0;
+  }
 
   template <class T>
   class PPtrRootOffset
   {
-    T* ptr = nullptr;
+    uint64_t offs = 0;
+
+    PPtrRootOffset(uint64_t _offs)
+    {
+      offs = _offs;
+    }
 
   public:
 
@@ -367,50 +772,54 @@ namespace PersistentObjects
     PPtrRootOffset(T* p)
     {
       if (p == nullptr) {
-        ptr = p;
-      }
-      else {
-        assert((uint64_t)p >= root->base);
-        ptr = (T*)((uint8_t*)p - root->base);
+        offs = 0;
+      } else {
+        offs = ptr2poffs(p);
       }
     }
 
     PPtrRootOffset(const PPtrRootOffset& from)
     {
-      ptr = from.ptr;
+      offs = from.offs;
+    }
+    inline bool is_null() const {
+      return offs == 0;
     }
     PPtrRootOffset<T> operator++()
     {
-      ptr++;
+      offs += sizeof(T);
       return this;
     }
-    operator T*() const
-    {
-      return reinterpret_cast<T*>((uint8_t*)ptr + root->base);
+    T* get() const {
+      return poffs2ptr<T>(offs);
     }
-    T* operator ->() const
-    {
-
-      return reinterpret_cast<T*>((uint8_t*)ptr + root->base);
+    operator T*() const {
+      return get();
+    }
+    T* operator ->() const {
+      return get();
+    }
+    inline void die(TransactionRoot& t) {
+      get()->die(t);
     }
     size_t operator -(const PPtrRootOffset<T>& p) const
     {
-      return (ptr - p.ptr);
+      return (offs - p.offs) / sizeof(T);
 
     }
     PPtrRootOffset<T>& operator +(size_t delta) const
     {
-      PPtrRootOffset<T> p(ptr + delta);
+      PPtrRootOffset<T> p(offs + delta * sizeof(T));
       return p;
     }
 
     bool operator !=(const PPtrRootOffset<T>& p) const
     {
-      return ptr != p.ptr;
+      return offs != p.offs;
     }
     bool operator !=(nullptr_t) const
     {
-      return ptr != nullptr;
+      return offs != 0;
     }
     template <typename U>
     static PPtrRootOffset<T> pointer_to(U& r)
@@ -419,7 +828,7 @@ namespace PersistentObjects
     }
 
     template <class U, typename... Args>
-    static PPtrRootOffset<PObj<U>> alloc_persistent_obj(TransactionalRoot& tr, Args&&... args) {
+    static PPtrRootOffset<PObj<U>> alloc_persistent_obj(TransactionRoot& tr, Args&&... args) {
       U* t = new (tr, 0) U(args...);
       return new (tr, 0) PObj<U>(tr.get_effective_id(), t);
     }
@@ -527,7 +936,7 @@ namespace PersistentObjects
     }
 
     template <class U, typename... Args>
-    static PPtrThisOffset<PObj<U>> alloc_persistent_obj(TransactionalRoot& tr, Args&&... args) {
+    static PPtrThisOffset<PObj<U>> alloc_persistent_obj(TransactionRoot& tr, Args&&... args) {
       U* t = new (tr) U(args...);
       return new (tr) PObj<U>(tr.get_effective_id(), t);
     }
@@ -560,6 +969,12 @@ namespace PersistentObjects
       : offset_ptr<T>(static_cast<const T*>(from))
     {
       //std::enable_if<std::is_same<const T, const U>::value>::type;
+    }
+    inline bool is_null() const {
+      return offset_ptr<T>::get() == nullptr;
+    }
+    inline void die(TransactionRoot& t) {
+      offset_ptr<T>::get()->die(t);
     }
     inline PBoostOffsetPtr& operator=(const PBoostOffsetPtr from)
     {
@@ -626,7 +1041,7 @@ namespace PersistentObjects
     }*/
 
     template <class U, typename... Args>
-    static PBoostOffsetPtr<PObj<U>> alloc_persistent_obj(TransactionalRoot& tr, Args&&... args) {
+    static PBoostOffsetPtr<PObj<U>> alloc_persistent_obj(TransactionRoot& tr, Args&&... args) {
       U* t = new (tr, 0) U(args...);
       return new (tr, 0) PObj<U>(tr.get_effective_id(), t);
     }
@@ -675,15 +1090,17 @@ namespace PersistentObjects
     pointer allocate(size_type count, const_pointer /* hint */ = nullptr)
     {
       //if (count > max_size()) { throw std::bad_alloc(); }
-      assert(working_transactional_root);
-      //return static_cast<pointer>(working_transactional_root->alloc_persistent_raw(count * sizeof(type)));
+      assert(working_Transaction_root);
+      //return static_cast<pointer>(working_Transaction_root->alloc_persistent_raw(count * sizeof(type)));
       //pointer p;
-      //p.reset(working_transactional_root->alloc_persistent_raw(count * sizeof(type)));
+      //p.reset(working_Transaction_root->alloc_persistent_raw(count * sizeof(type)));
       //return p;
 
-      //return pointer::alloc_persistent_count(*working_transactional_root, count);
+      //return pointer::alloc_persistent_count(*working_Transaction_root, count);
 
-      uint64_t* p = (uint64_t*)working_transactional_root->alloc_persistent_raw(count * sizeof(type) + sizeof(uint64_t));
+      uint64_t* p = reinterpret_cast<uint64_t*>(
+        working_Transaction_root->alloc_persistent_raw(count * sizeof(type) + sizeof(uint64_t)) +
+          root->base);
       *p = count * sizeof(type) + sizeof(uint64_t);
       return pointer((type*)(p + 1));
     }
@@ -691,11 +1108,16 @@ namespace PersistentObjects
     // Delete memory
     void deallocate(pointer ptr, size_type /* count */)
     {
+      if (ptr.is_null())
+        return;
       //std::cout << "deallocate"<< (uint64_t)(T*)ptr << std::endl;
-      assert(working_transactional_root);
+      assert(working_Transaction_root);
       uint64_t* p = (uint64_t*)(void*)ptr;
       --p;
-      working_transactional_root->queue_for_release((void*)p, *p);
+      uint64_t offs = reinterpret_cast<uint64_t>(p);
+      assert(offs > root->base);
+      offs -= root->base;
+      working_Transaction_root->queue_for_release(offs, *p);
     }
 /*    template <class... Args>
     static void construct (allocator_type& alloc, pointer p, Args&&... args)
@@ -784,9 +1206,10 @@ namespace PersistentObjects
     pointer allocate(size_type count, const_pointer /* hint */ = 0)
     {
       //if (count > max_size()) { throw std::bad_alloc(); }
-      assert(working_transactional_root);
-      //return static_cast<pointer>(working_transactional_root->alloc_persistent_raw(count * sizeof(type)));
-      uint64_t* p = (uint64_t*)working_transactional_root->alloc_persistent_raw(count * sizeof(type) + sizeof(uint64_t));
+      assert(working_Transaction_root);
+      uint64_t* p = reinterpret_cast<uint64_t*>(
+        working_Transaction_root->alloc_persistent_raw(count * sizeof(type) + sizeof(uint64_t)) +
+        root->base);
       *p = count * sizeof(type) + sizeof(uint64_t);
       return pointer((void*)(p+1));
     }
@@ -794,10 +1217,16 @@ namespace PersistentObjects
     // Delete memory
     void deallocate(pointer ptr, size_type /* count */)
     {
-      assert(working_transactional_root);
+      if (ptr == nullptr)
+        return;
+      assert(working_Transaction_root);
       uint64_t* p = (uint64_t*)(void*)ptr;
       --p;
-      working_transactional_root->queue_for_release((void*)p, *p);
+
+      uint64_t offs = reinterpret_cast<uint64_t>(p);
+      assert(offs > root->base);
+      offs -= root->base;
+      working_Transaction_root->queue_for_release(offs, *p);
     }
   };
   template <class T>
@@ -819,17 +1248,18 @@ namespace PersistentObjects
 
 #define PERSISTENT_CLASS_DECL(c) \
   class c; \
-  typedef PersistentObjects::PPtr<PersistentObjects::PObj<c>> c##Ptr;
+  typedef PersistentObjects::PPtr<PersistentObjects::PObj<c>> c##Ptr; \
+  typedef PersistentObjects::PUniquePtr<c> c##UniquePtr;
 
 #define PERSISTENT_CLASS(c) \
   PERSISTENT_CLASS_DECL(c)  \
   class c : public PersistentObjects::PObjBase
 
-#define PERSISTENT_DEAD void die(TransactionalRoot& tr)
+#define PERSISTENT_DEAD void die(TransactionRoot& tr)
 
 #define PERSISTENT_DIE(a) { \
-  if (a != nullptr) {\
-    a->die(tr);\
+  if (!a.is_null()) {\
+    a.die(tr);\
   }\
 }
 #endif
